@@ -34,6 +34,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/googleapis/gax-go/v2/apierror"
+
 	"cloud.google.com/go/civil"
 	"cloud.google.com/go/internal/testutil"
 	"cloud.google.com/go/internal/uid"
@@ -427,6 +429,35 @@ func initIntegrationTests() (cleanup func()) {
 		cleanupInstances()
 		databaseAdmin.Close()
 		instanceAdmin.Close()
+	}
+}
+
+func TestIntegration_IsSessionNotFoundError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	// Set up an empty testing environment.
+	client, _, cleanup := prepareIntegrationTest(ctx, t, DefaultSessionPoolConfig, []string{})
+	defer cleanup()
+
+	s, err := client.sc.createSession(context.Background())
+	if err != nil {
+		t.Fatalf("Unexpected error creating session: %v", err)
+	}
+
+	// This will delete the session on the backend without removing it
+	// from the pool.
+	err = s.client.DeleteSession(contextWithOutgoingMetadata(ctx, s.md), &sppb.DeleteSessionRequest{Name: s.  getID()})
+	if err != nil {
+		t.Fatalf("Unexpected error deleting session: %v", err)
+	}
+	_, err = s.client.GetSession(contextWithOutgoingMetadata(ctx, s.md), &sppb.GetSessionRequest{Name: s.     getID()})
+
+	if apie, ok := err.(*apierror.APIError); ok {
+		if apie.GRPCStatus().Code() == codes.NotFound &&
+			strings.HasPrefix(apie.GRPCStatus().Message(), "Session not found:") &&
+			!isSessionNotFoundError(err) {
+			t.Fatalf("Session not found error failed isSessionNotFoundError: %v", err)
+		}
 	}
 }
 
