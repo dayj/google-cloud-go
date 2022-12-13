@@ -467,6 +467,14 @@ loop:
 		// This will delete the session on the backend without removing it
 		// from the pool.
 		s.Value.(*session).delete(context.Background())
+		for {
+			z := s.Value.(*session)
+			_, err := z.client.GetSession(contextWithOutgoingMetadata(ctx, z.md), &sppb.GetSessionRequest{Name: z.getID()})
+			if err != nil && ErrCode(err) == codes.NotFound {
+				// definitely deleted
+				break
+			}
+		}
 		s = s.Next()
 	}
 	sp.mu.Unlock()
