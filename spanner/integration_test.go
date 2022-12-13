@@ -22,6 +22,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/googleapis/gax-go/v2/apierror"
 	"log"
 	"math"
 	"math/big"
@@ -40,7 +41,6 @@ import (
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	adminpb "cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	instance "cloud.google.com/go/spanner/admin/instance/apiv1"
-	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
 	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"cloud.google.com/go/spanner/internal"
 	"go.opencensus.io/stats/view"
@@ -325,7 +325,7 @@ const (
 func TestMain(m *testing.M) {
 	cleanup := initIntegrationTests()
 	defer cleanup()
-	for _, dialect := range []adminpb.DatabaseDialect{adminpb.DatabaseDialect_GOOGLE_STANDARD_SQL, adminpb.DatabaseDialect_POSTGRESQL} {
+	for _, dialect := range []adminpb.DatabaseDialect{adminpb.DatabaseDialect_GOOGLE_STANDARD_SQL} {
 		if isEmulatorEnvSet() && dialect == adminpb.DatabaseDialect_POSTGRESQL {
 			// PG tests are not supported in emulator
 			continue
@@ -342,7 +342,7 @@ func TestMain(m *testing.M) {
 var grpcHeaderChecker = testutil.DefaultHeadersEnforcer()
 
 func initIntegrationTests() (cleanup func()) {
-	ctx := context.Background()
+	_ = context.Background()
 	flag.Parse() // Needed for testing.Short().
 	noop := func() {}
 
@@ -356,77 +356,35 @@ func initIntegrationTests() (cleanup func()) {
 		return noop
 	}
 
-	opts := grpcHeaderChecker.CallOptions()
-	if spannerHost != "" {
-		opts = append(opts, option.WithEndpoint(spannerHost))
-	}
-	if dpConfig.attemptDirectPath {
-		opts = append(opts, option.WithGRPCDialOption(grpc.WithDefaultCallOptions(grpc.Peer(peerInfo))))
-	}
-	var err error
-	// Create InstanceAdmin and DatabaseAdmin clients.
-	instanceAdmin, err = instance.NewInstanceAdminClient(ctx, opts...)
+	return func() {}
+}
+
+func TestIntegration_IsSessionNotFoundError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	// Set up an empty testing environment.
+	client, _, cleanup := prepareIntegrationTest(ctx, t, DefaultSessionPoolConfig, []string{})
+	defer cleanup()
+
+	s, err := client.sc.createSession(context.Background())
 	if err != nil {
-		log.Fatalf("cannot create instance databaseAdmin client: %v", err)
+		t.Fatalf("Unexpected error creating session: %v", err)
 	}
-	databaseAdmin, err = database.NewDatabaseAdminClient(ctx, opts...)
+
+	// This will delete the session on the backend without removing it
+	// from the pool.
+	err = s.client.DeleteSession(contextWithOutgoingMetadata(ctx, s.md), &sppb.DeleteSessionRequest{Name: s.getID()})
 	if err != nil {
-		log.Fatalf("cannot create databaseAdmin client: %v", err)
+		t.Fatalf("Unexpected error deleting session: %v", err)
 	}
-	var configName string
-	if instanceConfig != "" {
-		configName = fmt.Sprintf("projects/%s/instanceConfigs/%s", testProjectID, instanceConfig)
-	} else {
-		// Get the list of supported instance configs for the project that is used
-		// for the integration tests. The supported instance configs can differ per
-		// project. The integration tests will use the first instance config that
-		// is returned by Cloud Spanner. This will normally be the regional config
-		// that is physically the closest to where the request is coming from.
-		configIterator := instanceAdmin.ListInstanceConfigs(ctx, &instancepb.ListInstanceConfigsRequest{
-			Parent: fmt.Sprintf("projects/%s", testProjectID),
-		})
-		config, err := configIterator.Next()
-		if err != nil {
-			log.Fatalf("Cannot get any instance configurations.\nPlease make sure the Cloud Spanner API is enabled for the test project.\nGet error: %v", err)
+	_, err = s.client.GetSession(contextWithOutgoingMetadata(ctx, s.md), &sppb.GetSessionRequest{Name: s.getID()})
+
+	if apie, ok := err.(*apierror.APIError); ok {
+		if apie.GRPCStatus().Code() == codes.NotFound &&
+			strings.HasPrefix(apie.GRPCStatus().Message(), "Session not found:") &&
+			!isSessionNotFoundError(err) {
+			t.Fatalf("Session not found error failed isSessionNotFoundError: %v", err)
 		}
-		configName = config.Name
-	}
-	log.Printf("Running test by using the instance config: %s\n", configName)
-
-	// First clean up any old test instances before we start the actual testing
-	// as these might cause this test run to fail.
-	cleanupInstances()
-
-	// Create a test instance to use for this test run.
-	op, err := instanceAdmin.CreateInstance(ctx, &instancepb.CreateInstanceRequest{
-		Parent:     fmt.Sprintf("projects/%s", testProjectID),
-		InstanceId: testInstanceID,
-		Instance: &instancepb.Instance{
-			Config:      configName,
-			DisplayName: testInstanceID,
-			NodeCount:   1,
-		},
-	})
-	if err != nil {
-		log.Fatalf("could not create instance with id %s: %v", fmt.Sprintf("projects/%s/instances/%s", testProjectID, testInstanceID), err)
-	}
-	// Wait for the instance creation to finish.
-	i, err := op.Wait(ctx)
-	if err != nil {
-		log.Fatalf("waiting for instance creation to finish failed: %v", err)
-	}
-	if i.State != instancepb.Instance_READY {
-		log.Printf("instance state is not READY, it might be that the test instance will cause problems during tests. Got state %v\n", i.State)
-	}
-
-	return func() {
-		// Delete this test instance.
-		instanceName := fmt.Sprintf("projects/%v/instances/%v", testProjectID, testInstanceID)
-		deleteInstanceAndBackups(ctx, instanceName)
-		// Delete other test instances that may be lingering around.
-		cleanupInstances()
-		databaseAdmin.Close()
-		instanceAdmin.Close()
 	}
 }
 
@@ -467,9 +425,18 @@ loop:
 		// This will delete the session on the backend without removing it
 		// from the pool.
 		s.Value.(*session).delete(context.Background())
+		for {
+			z := s.Value.(*session)
+			_, err := z.client.GetSession(contextWithOutgoingMetadata(ctx, z.md), &sppb.GetSessionRequest{Name: z.getID()})
+			if err != nil && ErrCode(err) == codes.NotFound {
+				// definitely deleted
+				break
+			}
+		}
 		s = s.Next()
 	}
 	sp.mu.Unlock()
+
 	sql := "SELECT 1, 'FOO', 'BAR'"
 	tx := client.ReadOnlyTransaction()
 	defer tx.Close()
@@ -3784,107 +3751,17 @@ func prepareIntegrationTestForPG(ctx context.Context, t *testing.T, spc SessionP
 }
 
 func prepareDBAndClient(ctx context.Context, t *testing.T, spc SessionPoolConfig, statements []string, dbDialect adminpb.DatabaseDialect) (*Client, string, func()) {
-	if databaseAdmin == nil {
-		t.Skip("Integration tests skipped")
-	}
-	// Construct a unique test DB name.
-	dbName := dbNameSpace.New()
 
-	dbPath := fmt.Sprintf("projects/%v/instances/%v/databases/%v", testProjectID, testInstanceID, dbName)
-	// Create database and tables.
-	req := &adminpb.CreateDatabaseRequest{
-		Parent:          fmt.Sprintf("projects/%v/instances/%v", testProjectID, testInstanceID),
-		CreateStatement: "CREATE DATABASE " + dbName,
-		ExtraStatements: statements,
-		DatabaseDialect: dbDialect,
-	}
-	if dbDialect == adminpb.DatabaseDialect_POSTGRESQL {
-		req.ExtraStatements = []string{}
-	}
-	op, err := databaseAdmin.CreateDatabaseWithRetry(ctx, req)
-	if err != nil {
-		t.Fatalf("cannot create testing DB %v: %v", dbPath, err)
-	}
-	if _, err := op.Wait(ctx); err != nil {
-		t.Fatalf("cannot create testing DB %v: %v", dbPath, err)
-	}
-	if dbDialect == adminpb.DatabaseDialect_POSTGRESQL && len(statements) > 0 {
-		op, err := databaseAdmin.UpdateDatabaseDdl(ctx, &adminpb.UpdateDatabaseDdlRequest{
-			Database:   dbPath,
-			Statements: statements,
-		})
-		if err != nil {
-			t.Fatalf("cannot create testing table %v: %v", dbPath, err)
-		}
-		if err := op.Wait(ctx); err != nil {
-			t.Fatalf("timeout creating testing table %v: %v", dbPath, err)
-		}
-	}
+	existingInstance := "" // existing instance here
+	existingDatabase := "" // existing database here
+	dbPath := fmt.Sprintf("projects/%v/instances/%v/databases/%v", testProjectID, existingInstance, existingDatabase)
+
 	client, err := createClient(ctx, dbPath, spc)
 	if err != nil {
 		t.Fatalf("cannot create data client on DB %v: %v", dbPath, err)
 	}
 	return client, dbPath, func() {
 		client.Close()
-	}
-}
-
-func cleanupInstances() {
-	if instanceAdmin == nil {
-		// Integration tests skipped.
-		return
-	}
-
-	ctx := context.Background()
-	parent := fmt.Sprintf("projects/%v", testProjectID)
-	iter := instanceAdmin.ListInstances(ctx, &instancepb.ListInstancesRequest{
-		Parent: parent,
-		Filter: "name:gotest-",
-	})
-	expireAge := 24 * time.Hour
-
-	for {
-		inst, err := iter.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			panic(err)
-		}
-
-		_, instID, err := parseInstanceName(inst.Name)
-		if err != nil {
-			log.Printf("Error: %v\n", err)
-			continue
-		}
-		if instanceNameSpace.Older(instID, expireAge) {
-			log.Printf("Deleting instance %s", inst.Name)
-			deleteInstanceAndBackups(ctx, inst.Name)
-		}
-	}
-}
-
-func deleteInstanceAndBackups(ctx context.Context, instanceName string) {
-	// First delete any lingering backups that might have been left on
-	// the instance.
-	backups := databaseAdmin.ListBackups(ctx, &adminpb.ListBackupsRequest{Parent: instanceName})
-	for {
-		backup, err := backups.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			log.Printf("failed to retrieve backups from instance %s because of error %v", instanceName, err)
-			break
-		}
-		if err := databaseAdmin.DeleteBackup(ctx, &adminpb.DeleteBackupRequest{Name: backup.Name}); err != nil {
-			log.Printf("failed to delete backup %s (error %v)", backup.Name, err)
-		}
-	}
-
-	if err := instanceAdmin.DeleteInstance(ctx, &instancepb.DeleteInstanceRequest{Name: instanceName}); err != nil {
-		log.Printf("failed to delete instance %s (error %v), might need a manual removal",
-			instanceName, err)
 	}
 }
 
